@@ -61,9 +61,12 @@ const PROXY_TOKEN = process.env.PROXY_TOKEN;
 let channel;
 let rabbitmqConnection;
 
-const maxConnectAttempts = 10; // Número máximo de tentativas de reconexão
-let connectAttempts = 0;
+// Usaremos um contador de tentativas para calcular o delay: 2, 4, 8, 16, ... segundos.
+// Quando a conexão for bem-sucedida, o contador é resetado para 1.
+let connectAttempts = 1;
 
+// Inicia a conexão com o RabbitMQ e cria o canal.
+// Em caso de erro, usa backoff exponencial sem limite máximo.
 function startRabbitMQConnection(callback) {
     amqp.connect({
         protocol: 'amqp',
@@ -75,39 +78,33 @@ function startRabbitMQConnection(callback) {
     }, function (err, connection) {
         if (err) {
             console.error('[AMQP] Erro ao conectar:', err.message);
+            const delay = Math.pow(2, connectAttempts) * 1000; // 2, 4, 8, 16, ... segundos
+            console.log(`Tentando reconectar... Tentativa ${connectAttempts}, aguardando ${delay} ms`);
             connectAttempts++;
-            if (connectAttempts < maxConnectAttempts) {
-                return setTimeout(() => {
-                    console.log(`Tentando reconectar... Tentativa ${connectAttempts}/${maxConnectAttempts}`);
-                    startRabbitMQConnection(callback);
-                }, 1000); // Tenta reconectar após 1 segundo
-            } else {
-                console.error('Número máximo de tentativas de reconexão atingido.');
-                process.exit(1);
-            }
+            return setTimeout(() => {
+                startRabbitMQConnection(callback);
+            }, delay);
         }
         connection.on('error', function (err) {
             if (err.message !== 'Connection closing') {
                 console.error('[AMQP] Erro na conexão:', err.message);
             }
+            // Não encerra aqui; o evento 'close' cuidará da reconexão.
         });
 
         connection.on('close', function () {
             console.error('[AMQP] Conexão fechada.');
+            const delay = Math.pow(2, connectAttempts) * 1000;
+            console.log(`Tentando reconectar após fechamento... Tentativa ${connectAttempts}, aguardando ${delay} ms`);
             connectAttempts++;
-            if (connectAttempts < maxConnectAttempts) {
-                return setTimeout(() => {
-                    console.log(`Tentando reconectar após fechamento... Tentativa ${connectAttempts}/${maxConnectAttempts}`);
-                    startRabbitMQConnection(callback);
-                }, 1000);
-            } else {
-                console.error('Número máximo de tentativas de reconexão após fechamento atingido.');
-                process.exit(1);
-            }
+            return setTimeout(() => {
+                startRabbitMQConnection(callback);
+            }, delay);
         });
 
         console.log('[AMQP] Conectado com sucesso.');
-        connectAttempts = 0;
+        // Reseta o contador de tentativas ao estabelecer conexão com sucesso.
+        connectAttempts = 1;
         rabbitmqConnection = connection;
         createChannel(callback);
     });
@@ -117,9 +114,12 @@ function createChannel(callback) {
     rabbitmqConnection.createChannel(function (err, ch) {
         if (err) {
             console.error('[AMQP] Erro ao criar o canal:', err.message);
+            const delay = Math.pow(2, connectAttempts) * 1000;
+            console.log(`Tentando recriar o canal em ${delay} ms...`);
+            connectAttempts++;
             return setTimeout(() => {
                 createChannel(callback);
-            }, 1000);
+            }, delay);
         }
         channel = ch;
 
@@ -129,10 +129,12 @@ function createChannel(callback) {
 
         channel.on('close', function () {
             console.error('[AMQP] Canal fechado.');
-            // Tenta recriar o canal
+            const delay = Math.pow(2, connectAttempts) * 1000;
+            console.log(`Tentando recriar o canal em ${delay} ms...`);
+            connectAttempts++;
             setTimeout(() => {
                 createChannel(callback);
-            }, 1000);
+            }, delay);
         });
 
         console.log('[AMQP] Canal criado com sucesso.');
@@ -315,7 +317,7 @@ async function processVideoCreation(msg, attempt = 0, currentIndex = 0, log = ''
                     }
                 });
             });
-        }, 600000); // 600000 milissegundos = 10 minutos
+        }, 600000); // 10 minutos
 
         await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/videos', {
             videoNames,
@@ -384,7 +386,7 @@ function setupConsumer() {
             await processVideoCreation(msg);
         } catch (error) {
             console.error('Erro ao processar a mensagem:', error);
-            channel.nack(msg, false, false); // Rejeita a mensagem sem reencaminhar
+            channel.nack(msg, false, false);
         }
     }, { noAck: false });
 }
