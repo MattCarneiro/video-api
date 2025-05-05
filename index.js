@@ -1,466 +1,355 @@
 // index.js
-
+require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const amqp = require('amqplib/callback_api');
-const { exec } = require('child_process');
-const progress = require('progress-stream');
-require('dotenv').config();
+const PDFDocument = require('pdfkit');
+const FormData = require('form-data');
+// Ajuste no import do image-size
+let sizeOf = require('image-size');
+if (sizeOf.default) sizeOf = sizeOf.default;
 
-// Importação e configuração do Redis
-const { createClient } = require('redis');
-
-// Configura o cliente Redis
-const redisClient = createClient({
-    url: process.env.REDIS_URL,
-});
-
-redisClient.on('error', (err) => {
-    console.error('Erro ao conectar ao Redis:', err);
-});
-
-redisClient.on('connect', () => {
-    console.log('Conectado ao Redis');
-});
-
-// Inicializa a conexão com o Redis
-(async () => {
-    try {
-        await redisClient.connect();
-    } catch (err) {
-        console.error('Erro ao conectar ao Redis:', err);
-    }
-})();
+// Dependência para conversão de imagens
+const sharp = require('sharp');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-const API_KEY = process.env.GOOGLE_DRIVE_API_KEY;
-const BACKOFF_RETRIES = parseInt(process.env.BACKOFF_RETRIES, 10) || 7;
-const videoStoragePath = './public/';
-if (!fs.existsSync(videoStoragePath)) {
-    fs.mkdirSync(videoStoragePath, { recursive: true });
-}
+// RabbitMQ config
+const RABBITMQ_HOST    = process.env.RABBITMQ_HOST;
+const RABBITMQ_PORT    = process.env.RABBITMQ_PORT;
+const RABBITMQ_USER    = process.env.RABBITMQ_USER;
+const RABBITMQ_PASS    = process.env.RABBITMQ_PASS;
+const RABBITMQ_VHOST   = process.env.RABBITMQ_VHOST;
+const QUEUE_NAME       = process.env.QUEUE_NAME;
+const PREFETCH_COUNT   = parseInt(process.env.PREFETCH_COUNT, 10) || 1;
 
-app.use(express.static('public'));
+// General retries / backoff
+const BACKOFF_RETRIES  = parseInt(process.env.BACKOFF_RETRIES, 10) || 7;
+const MAX_BACKOFF_MS   = 32000;
+
+// Auth for image download and CRM patch
+const API_USER         = process.env.BASIC_AUTH_USER || 'corporativo@neuralbase.com.br';
+const API_PASS         = process.env.BASIC_AUTH_PASS || 'Hunted123@@321';
+
+// Upload PDF
+const MEDIA_UPLOAD_URL = process.env.MEDIA_UPLOAD_URL   || 'https://media.neuralbroker.com.br/api/upload';
+const MEDIA_AUTH_TOKEN = process.env.MEDIA_AUTH_TOKEN   || 'g3cetNqmuXSgwHGpXU95LyGw.MTcxNzQ2NzExNjAzMw';
+
+// Temp folder
+const tmpDir = path.resolve(__dirname, 'tmp');
+if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
 app.use(express.json());
 
-// Configurações do RabbitMQ
-const RABBITMQ_HOST = process.env.RABBITMQ_HOST;
-const RABBITMQ_PORT = process.env.RABBITMQ_PORT;
-const RABBITMQ_USER = process.env.RABBITMQ_USER;
-const RABBITMQ_PASS = process.env.RABBITMQ_PASS;
-const RABBITMQ_VHOST = process.env.RABBITMQ_VHOST;
-const QUEUE_TYPE = process.env.RABBITMQ_QUEUE_TYPE;  // Tipo da fila (lazy ou quorum)
-let QUEUE_NAME = process.env.QUEUE_NAME;  // Nome base da fila
-const PREFETCH_COUNT = parseInt(process.env.PREFETCH_COUNT, 10); // Prefetch Count configurável
-const PROXY_TOKEN = process.env.PROXY_TOKEN;
-
 let channel;
-let rabbitmqConnection;
+let connection;           // <<< Adicionado >>>
+let reconnectAttempts = 1;
 
-// Usaremos um contador de tentativas para calcular o delay: 2, 4, 8, 16, ... segundos.
-// Quando a conexão for bem-sucedida, o contador é resetado para 1.
-let connectAttempts = 1;
-
-// Inicia a conexão com o RabbitMQ e cria o canal.
-// Em caso de erro, usa backoff exponencial sem limite máximo.
-function startRabbitMQConnection(callback) {
-    amqp.connect({
-        protocol: 'amqp',
-        hostname: RABBITMQ_HOST,
-        port: RABBITMQ_PORT,
-        username: RABBITMQ_USER,
-        password: RABBITMQ_PASS,
-        vhost: RABBITMQ_VHOST,
-    }, function (err, connection) {
-        if (err) {
-            console.error('[AMQP] Erro ao conectar:', err.message);
-            const delay = Math.pow(2, connectAttempts) * 1000; // 2, 4, 8, 16, ... segundos
-            console.log(`Tentando reconectar... Tentativa ${connectAttempts}, aguardando ${delay} ms`);
-            connectAttempts++;
-            return setTimeout(() => {
-                startRabbitMQConnection(callback);
-            }, delay);
-        }
-        connection.on('error', function (err) {
-            if (err.message !== 'Connection closing') {
-                console.error('[AMQP] Erro na conexão:', err.message);
-            }
-            // Não encerra aqui; o evento 'close' cuidará da reconexão.
-        });
-
-        connection.on('close', function () {
-            console.error('[AMQP] Conexão fechada.');
-            const delay = Math.pow(2, connectAttempts) * 1000;
-            console.log(`Tentando reconectar após fechamento... Tentativa ${connectAttempts}, aguardando ${delay} ms`);
-            connectAttempts++;
-            return setTimeout(() => {
-                startRabbitMQConnection(callback);
-            }, delay);
-        });
-
-        console.log('[AMQP] Conectado com sucesso.');
-        // Reseta o contador de tentativas ao estabelecer conexão com sucesso.
-        connectAttempts = 1;
-        rabbitmqConnection = connection;
-        createChannel(callback);
-    });
+/** Sleep helper */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function createChannel(callback) {
-    rabbitmqConnection.createChannel(function (err, ch) {
-        if (err) {
-            console.error('[AMQP] Erro ao criar o canal:', err.message);
-            const delay = Math.pow(2, connectAttempts) * 1000;
-            console.log(`Tentando recriar o canal em ${delay} ms...`);
-            connectAttempts++;
-            return setTimeout(() => {
-                createChannel(callback);
-            }, delay);
-        }
-        channel = ch;
-
-        channel.on('error', function (err) {
-            console.error('[AMQP] Erro no canal:', err.message);
-        });
-
-        channel.on('close', function () {
-            console.error('[AMQP] Canal fechado.');
-            const delay = Math.pow(2, connectAttempts) * 1000;
-            console.log(`Tentando recriar o canal em ${delay} ms...`);
-            connectAttempts++;
-            setTimeout(() => {
-                createChannel(callback);
-            }, delay);
-        });
-
-        console.log('[AMQP] Canal criado com sucesso.');
-        callback();
-    });
-}
-
-async function fetchWithExponentialBackoff(url, options, retries = BACKOFF_RETRIES) {
-    const fetch = (await import('node-fetch')).default;
-    let retryCount = 0;
-    const maxBackoff = 32000;
-
-    while (retryCount < retries) {
-        try {
-            const res = await fetch(url, options);
-            if (!res.ok) {
-                throw new Error(`HTTP error! status: ${res.status}`);
-            }
-            return res;
-        } catch (error) {
-            const waitTime = Math.min(
-                Math.pow(2, retryCount) * 1000 + Math.floor(Math.random() * 1000),
-                maxBackoff
-            );
-            console.log(`Tentando novamente em ${waitTime} ms...`);
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-            retryCount++;
-        }
-    }
-    throw new Error(`Falha ao buscar ${url} após ${retries} tentativas`);
-}
-
-async function downloadVideo(fileUrl, filePath, index, total) {
-    const fetch = (await import('node-fetch')).default;
-    const res = await fetchWithExponentialBackoff(fileUrl, {}, BACKOFF_RETRIES);
-
-    const totalSize = res.headers.get('content-length');
-    const str = progress({
-        length: totalSize,
-        time: 100 /* ms */
-    });
-
-    str.on('progress', function (progress) {
-        console.log(`Baixando vídeo ${index + 1}/${total}: ${Math.round(progress.percentage)}%`);
-    });
-
-    const dest = fs.createWriteStream(filePath);
-    res.body.pipe(str).pipe(dest);
-
-    await new Promise((resolve, reject) => {
-        dest.on('finish', resolve);
-        dest.on('error', reject);
-    });
-
-    const stats = fs.statSync(filePath);
-    console.log(`Vídeo ${index + 1}/${total} tamanho: ${stats.size} bytes`);
-    if (stats.size > 16 * 1024 * 1024) { // 16 MB
-        const timestamp = new Date().toISOString().replace(/[-:.]/g, "");
-        const newPath = path.join(
-            videoStoragePath,
-            `${path.basename(filePath, path.extname(filePath))}_${timestamp}_converted.mp4`
-        );
-        const convertedPath = await convertVideo(filePath, newPath, index, total, [480, 320, 144]);
-        fs.unlinkSync(filePath);
-        if (convertedPath) {
-            return convertedPath;
-        } else {
-            console.log(`Vídeo ${index + 1}/${total} ignorado por ser maior que 16 MB após todas as conversões.`);
-            return null;
-        }
-    }
-
-    const finalPath = path.join(videoStoragePath, path.basename(filePath));
-    fs.renameSync(filePath, finalPath);
-    console.log(`Vídeo ${index + 1}/${total} baixado (${Math.round(((index + 1) / total) * 100)}%)`);
-    return finalPath;
-}
-
-async function convertVideo(inputPath, outputPath, index, total, widths) {
-    for (const width of widths) {
-        await new Promise((resolve, reject) => {
-            const command = `ffmpeg -i "${inputPath}" -vf "scale=${width}:-2" -b:v 1M "${outputPath}"`;
-            console.log(`Executando comando: ${command}`);
-            const ffmpegProcess = exec(command, (error, stdout, stderr) => {
-                if (error) {
-                    console.error(`Erro ao converter o vídeo para ${width}px: ${stderr}`);
-                    reject(error);
-                } else {
-                    resolve();
-                }
-            });
-
-            ffmpegProcess.stderr.on('data', (data) => {
-                const progress = parseFfmpegProgress(data.toString());
-                if (progress) {
-                    console.log(`Convertendo vídeo ${index + 1}/${total} para ${width}px: ${progress}%`);
-                }
-            });
-        });
-
-        const stats = fs.statSync(outputPath);
-        console.log(`Tamanho do vídeo convertido para ${width}px: ${stats.size} bytes`);
-        if (stats.size <= 16 * 1024 * 1024) { // 16 MB
-            console.log(`Vídeo ${index + 1}/${total} convertido para ${width}px (${Math.round(((index + 1) / total) * 100)}%)`);
-            return outputPath;
-        } else {
-            console.log(`Tamanho do vídeo convertido para ${width}px ainda é muito grande: ${stats.size} bytes`);
-        }
-    }
-    fs.unlinkSync(outputPath);
-    return null;
-}
-
-function parseFfmpegProgress(data) {
-    const match = data.match(/frame=.*time=(\d+:\d+:\d+)/);
-    if (match) {
-        const timeParts = match[1].split(':');
-        const totalSeconds = (+timeParts[0]) * 3600 + (+timeParts[1]) * 60 + (+timeParts[2]);
-        const duration = 3600; // Assumindo 1 hora de vídeo para simplificar a porcentagem
-        return Math.round((totalSeconds / duration) * 100);
-    }
-    return null;
-}
-
-async function getVideoUrlsFromFolder(folderId) {
-    const fetch = (await import('node-fetch')).default;
-    const url = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+(mimeType='video/mp4'+or+mimeType='video/avi'+or+mimeType='video/mkv')&key=${API_KEY}&fields=files(id,name,mimeType)`;
-    const res = await fetchWithExponentialBackoff(url, {}, BACKOFF_RETRIES);
-    const data = await res.json();
-    if (!data.files || data.files.length === 0) {
-        throw new Error('Nenhum vídeo encontrado na pasta especificada.');
-    }
-    return data.files.map(file => ({
-        url: `https://drive.google.com/uc?id=${file.id}`,
-        name: file.name
-    }));
-}
-
-async function processVideoCreation(msg, attempt = 0, currentIndex = 0, log = '') {
-    const { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf } = JSON.parse(msg.content.toString());
-
+/** Exponential backoff fetch */
+async function fetchWithBackoff(url, options = {}) {
+  for (let i = 0; i < BACKOFF_RETRIES; i++) {
     try {
-        const isFolderLink = link.includes('/folders/');
-        const folderIdOrFileId = extractIdFromLink(link);
-        let videos = [];
-
-        if (isFolderLink) {
-            videos = await getVideoUrlsFromFolder(folderIdOrFileId);
-        } else {
-            const videoUrl = `https://drive.google.com/uc?id=${folderIdOrFileId}`;
-            videos = [{ url: videoUrl, name: 'downloaded.mp4' }];
-        }
-
-        if (videos.length === 0) {
-            throw new Error('Nenhum vídeo encontrado na pasta ou arquivo especificado.');
-        }
-
-        const videoPaths = [];
-        for (let i = currentIndex; i < videos.length; i++) {
-            const videoPath = path.join(__dirname, `${videos[i].name}`);
-            const finalPath = await downloadVideo(videos[i].url, videoPath, i, videos.length);
-            if (finalPath) {
-                videoPaths.push(finalPath);
-            } else {
-                throw new Error(`Erro ao processar o vídeo ${i + 1}/${videos.length}`);
-            }
-        }
-
-        const videoNames = videoPaths.map(v => path.basename(v));
-        console.log(`Vídeos baixados e processados: ${videoNames.join(', ')}`);
-
-        // Agendar para apagar os vídeos após 10 minutos
-        setTimeout(() => {
-            videoPaths.forEach(videoPath => {
-                fs.unlink(videoPath, (err) => {
-                    if (err) {
-                        console.error(`Erro ao apagar o vídeo (${videoPath}):`, err);
-                    } else {
-                        console.log(`Vídeo (${videoPath}) apagado com sucesso.`);
-                    }
-                });
-            });
-        }, 600000); // 10 minutos
-
-        await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/videos', {
-            videoNames,
-            Id,
-            context,
-            UserMsg,
-            MsgIdPhoto, 
-            MsgIdVideo, 
-            MsgIdPdf,
-            link,
-            result: true
-        }).then(() => {
-            console.log(`Webhook enviado sem erros`);
-        }).catch(error => {
-            console.error(`Erro ao enviar webhook: ${error}`);
-        });
-
-        channel.ack(msg);
-    } catch (error) {
-        console.error('Erro ao processar o vídeo:', error);
-        log += `Erro ao processar o vídeo: ${error.message}\n    at ${error.stack}\n`;
-
-        if (attempt < BACKOFF_RETRIES) {
-            const waitTime = Math.min(Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 1000), 32000);
-            console.log(`Tentando novamente processVideoCreation em ${waitTime} ms... (tentativa ${attempt + 1}/${BACKOFF_RETRIES})`);
-            setTimeout(() => processVideoCreation(msg, attempt + 1, currentIndex, log), waitTime);
-        } else {
-            await axios.post('https://ultra-n8n.neuralbase.com.br/webhook/videos', {
-                videoNames: null,
-                Id,
-                context,
-                UserMsg,
-                MsgIdPhoto, 
-                MsgIdVideo, 
-                MsgIdPdf,
-                link,
-                result: false,
-                reason: log
-            }).then(() => {
-                console.log(`Webhook enviado com erros`);
-            }).catch(error => {
-                console.error(`Erro ao enviar webhook: ${error}`);
-            });
-
-            channel.nack(msg, false, false); // Rejeita a mensagem sem reencaminhar
-        }
+      const { default: fetch } = await import('node-fetch');
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (err) {
+      const wait = Math.min(2 ** i * 1000 + Math.random() * 1000, MAX_BACKOFF_MS);
+      console.log(`fetch retry #${i + 1} in ${Math.round(wait)}ms`);
+      await sleep(wait);
     }
+  }
+  throw new Error(`Failed to fetch ${url} after ${BACKOFF_RETRIES} attempts`);
 }
 
-function extractIdFromLink(link) {
-    const fileIdMatch = link.match(/\/d\/([a-zA-Z0-9-_]+)/);
-    const folderIdMatch = link.match(/\/folders\/([a-zA-Z0-9-_]+)/);
+/** RabbitMQ connect with backoff */
+function startRabbitMQConnection() {
+  amqp.connect({
+    protocol: 'amqp',
+    hostname: RABBITMQ_HOST,
+    port:     RABBITMQ_PORT,
+    username: RABBITMQ_USER,
+    password: RABBITMQ_PASS,
+    vhost:    RABBITMQ_VHOST,
+  }, (err, conn) => {
+    if (err) {
+      console.error('[AMQP] connect error:', err.message);
+      return scheduleReconnect();
+    }
+    connection = conn; // <<< Adicionado >>>
+    conn.on('error', () => scheduleReconnect());
+    conn.on('close', () => scheduleReconnect());
+    conn.createChannel((err, ch) => {
+      if (err) {
+        console.error('[AMQP] channel error:', err.message);
+        return scheduleReconnect();
+      }
+      channel = ch;
+      channel.prefetch(PREFETCH_COUNT);
+      reconnectAttempts = 1;
+      console.log('[AMQP] connected & channel created');
+      channel.consume(QUEUE_NAME, msg => processJob(msg), { noAck: false });
+    });
+  });
+}
 
-    if (fileIdMatch) {
-        return fileIdMatch[1];
-    } else if (folderIdMatch) {
-        return folderIdMatch[1];
+function scheduleReconnect() {
+  const delay = Math.min(2 ** reconnectAttempts++ * 1000, MAX_BACKOFF_MS);
+  console.log(`[AMQP] reconnecting in ${delay}ms`);
+  setTimeout(startRabbitMQConnection, delay);
+}
+
+/** Generate random filename or ID */
+function randomString(len) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  return Array.from({length: len}, () => chars.charAt(Math.floor(Math.random() * chars.length))).join('');
+}
+
+/** Patch CRM with generic error message */
+async function patchCrmError(Id) {
+  try {
+    await axios.patch(
+      `https://crm.neuralbroker.com.br/api/v1/CImovel/${Id}`,
+      { linkphoto: 'Erro! Tente Novamente em Instantes.' },
+      {
+        auth: { username: API_USER, password: API_PASS },
+        headers: { 'X-Skip-Duplicate-Check': 'true' }
+      }
+    );
+    console.log('CRM patched with error message');
+  } catch (err) {
+    console.error('Error patching CRM error message:', err.message);
+  }
+}
+
+/** Helper para detectar tipo de imagem via import dinâmico */
+async function detectFileType(buffer) {
+  const { fileTypeFromBuffer } = await import('file-type');
+  return fileTypeFromBuffer(buffer);
+}
+
+/** Main processor */
+async function processJob(msg) {
+  const {
+    array,
+    Id,
+    context,
+    UserMsg,
+    MsgIdPhoto,
+    MsgIdVideo,
+    MsgIdPdf,
+    photoId = ''
+  } = JSON.parse(msg.content.toString());
+
+  console.log(`Starting job for Id=${Id}, ${array.length} images, photoId=${photoId}`);
+
+  // 1) download images
+  const buffers = [];
+  for (let i = 0; i < array.length; i++) {
+    const code = array[i];
+    try {
+      console.log(`Downloading image ${i+1}/${array.length} (id=${code})`);
+      const res = await fetchWithBackoff(
+        `https://crm.neuralbroker.com.br/?entryPoint=download&id=${code}`,
+        {
+          headers: {
+            'Authorization': 'Basic ' + Buffer.from(`${API_USER}:${API_PASS}`).toString('base64')
+          }
+        }
+      );
+      const contentType = res.headers.get('content-type') || '';
+      console.log(`Content-Type da imagem ${i+1}:`, contentType);
+      const buf = Buffer.from(await res.arrayBuffer());
+      buffers.push(buf);
+      console.log(`Downloaded ${i+1}/${array.length}`);
+    } catch (err) {
+      console.warn(`Failed to download image ${i+1}, skipping:`, err.message);
+    }
+  }
+
+  if (buffers.length === 0) {
+    console.error('No images downloaded, aborting PDF');
+    await patchCrmError(Id);
+    channel.ack(msg);
+    return;
+  }
+
+  // 2) optional Attachment upload
+  let presentationId = photoId;
+  if (!presentationId) {
+    const pick = buffers.length > 5
+      ? buffers[Math.floor(Math.random() * 5)]
+      : buffers[Math.floor(Math.random() * buffers.length)];
+    const dataUri = `data:image/png;base64,${pick.toString('base64')}`;
+    console.log('Uploading one image to Attachment API');
+    const attRes = await axios.post(
+      'https://crm.neuralbroker.com.br/api/v1/Attachment',
+      {
+        role: 'Attachment',
+        relatedType: 'CImovel',
+        field: 'presentation',
+        file: dataUri,
+        type: 'image/jpeg',
+        name: randomString(10)
+      },
+      { auth: { username: API_USER, password: API_PASS } }
+    );
+    presentationId = attRes.data.id;
+    console.log('Received presentationId:', presentationId);
+  }
+
+  // 3) Build PDF — página do tamanho exato da imagem
+  const pdfName = `${randomString(15)}.pdf`;
+  const filePath = path.join(tmpDir, pdfName);
+  console.log(`Building PDF (${buffers.length} pages)`);
+  const doc = new PDFDocument({ autoFirstPage: false });
+  const ws = fs.createWriteStream(filePath);
+  doc.pipe(ws);
+
+  for (let idx = 0; idx < buffers.length; idx++) {
+    let imgBuf = buffers[idx];
+    // detecta formato real
+    const type = await detectFileType(imgBuf);
+    if (!type || !['png','jpg','jpeg'].includes(type.ext)) {
+      console.log(`Convertendo imagem ${idx+1} (${type?.mime}) para PNG`);
+      imgBuf = await sharp(imgBuf).png().toBuffer();
+    }
+    const { width, height } = sizeOf(imgBuf);
+    doc.addPage({ size: [width, height], margin: 0 });
+    doc.image(imgBuf, 0, 0, { width, height });
+    console.log(`Added image ${idx+1}/${buffers.length} to PDF (${width}×${height})`);
+  }
+
+  doc.end();
+  await new Promise((res, rej) => ws.on('finish', res).on('error', rej));
+  console.log('PDF built at', filePath);
+
+  // 4) Upload PDF
+  console.log('Uploading PDF to media API');
+  const form = new FormData();
+  form.append('file', fs.createReadStream(filePath), { filename: pdfName, contentType: 'application/pdf' });
+  let uploadRes;
+  try {
+    uploadRes = await axios.post(MEDIA_UPLOAD_URL, form, {
+      headers: { ...form.getHeaders(), 'X-Zipline-Filename': pdfName, 'Authorization': MEDIA_AUTH_TOKEN }
+    });
+  } catch (err) {
+    console.error('Upload failed:', err.message);
+    return retryOrFail(msg, filePath);
+  }
+
+  if (uploadRes.status !== 200 || !uploadRes.data.files?.[0]) {
+    console.error('Upload response invalid:', uploadRes.status);
+    return retryOrFail(msg, filePath);
+  }
+
+  const rawLink = uploadRes.data.files[0];
+  const linkphoto = rawLink.replace(/\/u\//, '/r/');
+  console.log('Uploaded PDF URL:', linkphoto);
+
+  // 5) Patch CRM
+  const patchData = { linkphoto, photomatrix: array };
+  if (!photoId) patchData.presentationId = presentationId;
+  console.log('Patching CRM with', patchData);
+
+  let success = false;
+  for (let i = 0; i < BACKOFF_RETRIES; i++) {
+    try {
+      await axios.patch(
+        `https://crm.neuralbroker.com.br/api/v1/CImovel/${Id}`,
+        patchData,
+        {
+          auth: { username: API_USER, password: API_PASS },
+          headers: { 'X-Skip-Duplicate-Check': 'true' }
+        }
+      );
+      success = true;
+      console.log('CRM patched successfully');
+      break;
+    } catch (err) {
+      console.warn(`CRM patch attempt ${i+1} failed:`, err.message);
+      if (i < BACKOFF_RETRIES - 1) {
+        await sleep(Math.min(2 ** i * 1000 + Math.random() * 1000, MAX_BACKOFF_MS));
+      }
+    }
+  }
+  if (!success) console.error('CRM patch failed after retries');
+
+  channel.ack(msg);
+  fs.unlink(filePath, () => {});
+}
+
+/** Retry entire job or final fail */
+function retryOrFail(msg, filePath) {
+  return (function attempt(attempt = 1) {
+    if (attempt < BACKOFF_RETRIES) {
+      const wait = Math.min(2 ** attempt * 1000 + Math.random() * 1000, MAX_BACKOFF_MS);
+      console.log(`Retrying job in ${wait}ms (attempt ${attempt+1}/${BACKOFF_RETRIES})`);
+      return setTimeout(() => processJob(msg), wait);
     } else {
-        return null;
+      console.error('Job failed after retries, sending CRM error');
+      patchCrmError(JSON.parse(msg.content.toString()).Id)
+        .finally(() => {
+          channel.nack(msg, false, false);
+          if (filePath) fs.unlink(filePath, () => {});
+        });
     }
+  })(1);
 }
 
-function setupConsumer() {
-    channel.consume(QUEUE_NAME, async (msg) => {
-        try {
-            await processVideoCreation(msg);
-        } catch (error) {
-            console.error('Erro ao processar a mensagem:', error);
-            channel.nack(msg, false, false);
-        }
-    }, { noAck: false });
+// Start RabbitMQ
+startRabbitMQConnection();
+
+// enqueue endpoint
+app.post('/download-pdfs', (req, res) => {
+  if (!channel) {
+    return res.status(500).send('RabbitMQ channel not ready');
+  }
+  const { array, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf, photoId = '' } = req.body;
+  if (!array || !Id) {
+    return res.status(400).send('array and Id required');
+  }
+  channel.sendToQueue(
+    QUEUE_NAME,
+    Buffer.from(JSON.stringify({ array, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf, photoId })),
+    { persistent: true }
+  );
+  res.send({ message: 'Job queued' });
+});
+
+// <<< Adicionado: healthz endpoint >>>
+app.get('/healthz', (req, res) =>
+  res.status(200).json({ status: 'ok' })
+);
+
+// <<< Adicionado: readiness endpoint >>>
+app.get('/readyz', (req, res) =>
+  res.status(200).json({ status: 'ready' })
+);
+
+// <<< Adicionado: graceful shutdown >>>
+const server = app.listen(port, () => console.log(`Server running on port ${port}`));
+function shutdown() {
+  console.log('Received shutdown signal, shutting down gracefully');
+  channel && channel.close();
+  connection && connection.close();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000);
 }
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
-// Inicia a conexão e, após estabelecida, configura o consumidor
-startRabbitMQConnection(() => {
-    console.log('Iniciando o consumidor...');
-    setupConsumer();
-});
-
-app.post('/create-video', async (req, res) => {
-    const { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf } = req.body;
-
-    if (!link || !Id) {
-        return res.status(400).send('Parâmetros ausentes: link e Id são necessários.');
-    }
-
-    // Implementação do controle de duplicação com Redis
-    const duplicateKey = `video_request:${Id}:${link}`;
-    try {
-        // Verifica se já existe um registro com o mesmo Id e link
-        const exists = await redisClient.get(duplicateKey);
-
-        if (exists) {
-            console.log(`Solicitação ignorada para Id: ${Id}, Link: ${link} (dentro da janela de 3 minutos)`);
-            return res.send({ message: 'Solicitação ignorada (já processada nos últimos 3 minutos).' });
-        } else {
-            // Armazena no Redis com TTL de 3 minutos (180 segundos)
-            await redisClient.setEx(duplicateKey, 180, 'processed');
-
-            const msg = { link, Id, context, UserMsg, MsgIdPhoto, MsgIdVideo, MsgIdPdf };
-            channel.sendToQueue(QUEUE_NAME, Buffer.from(JSON.stringify(msg)), {
-                persistent: true
-            });
-
-            console.log('Mensagem enviada para a fila');
-            res.send({ message: 'Iniciando criação dos vídeos.' });
-        }
-    } catch (error) {
-        console.error('Erro ao acessar o Redis:', error);
-        res.status(500).send('Erro interno do servidor.');
-    }
-});
-
-app.get('/download', (req, res) => {
-    const { videoName } = req.query;
-
-    if (!videoName) {
-        return res.status(400).send('Nome do vídeo não especificado.');
-    }
-
-    const filePath = path.join(videoStoragePath, videoName);
-
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).send('Vídeo não encontrado.');
-    }
-
-    res.download(filePath, videoName, (err) => {
-        if (err) {
-            console.error(`Erro ao baixar o vídeo (${videoName}):`, err);
-        }
-    });
-});
-
-app.listen(port, () => {
-    console.log(`Servidor rodando em http://localhost:${port}`);
-});
-
-// Força Garbage Collection se disponível
+// Force GC every minute if available
 if (global.gc) {
-    setInterval(() => {
-        console.log('Forçando Garbage Collection...');
-        global.gc();
-    }, 60000); // Executa a cada 60 segundos
+  setInterval(() => { console.log('Forçando GC...'); global.gc(); }, 60000);
 } else {
-    console.warn('Garbage collector não disponível. Execute com --expose-gc');
+  console.warn('GC not available; run with --expose-gc');
 }
